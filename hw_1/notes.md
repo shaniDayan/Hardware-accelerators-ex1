@@ -348,7 +348,7 @@ Each simulation is independent from the others.
 
 Therefore, running them sequentially creates unnecessary kernel-launch overhead and does not fully use the GPU parallelism across simulations.
 
-## Optimization idea
+### Optimization idea
 
 Use the z dimension of the CUDA grid to process all simulations in the same kernel launch.
 
@@ -370,14 +370,14 @@ for each timestep:
     launch one kernel for all simulations
 ```
 The CUDA grid becomes 3D:
-```text
+```c
 dim3 grid(
     (width + block.x - 1) / block.x,
     (height + block.y - 1) / block.y,
     num_simulations);
 ```
 Inside the kernel:
-
+```c
 int sim = blockIdx.z;
 
 size_t grid_cells = (size_t)width * (size_t)height;
@@ -385,10 +385,10 @@ size_t sim_offset = (size_t)sim * grid_cells;
 
 const float *sim_current = current + sim_offset;
 float *sim_next = next + sim_offset;
-
+```
 Each simulation gets its own slice inside the large device buffers.
 
-Buffer layout
+### Buffer layout
 
 Instead of allocating space for one simulation:
 
@@ -396,19 +396,19 @@ width * height
 
 we allocate space for all simulations:
 
-num_simulations * width * height
+`num_simulations * width * height`
 
 So the device buffers are arranged like this:
-
+```c
 d_buffer_a:
 [ simulation 0 grid ][ simulation 1 grid ][ simulation 2 grid ] ... [ simulation 9 grid ]
 
 d_buffer_b:
 [ simulation 0 grid ][ simulation 1 grid ][ simulation 2 grid ] ... [ simulation 9 grid ]
-
+```
 Each simulation is independent, but all of them are processed in the same kernel launch.
 
-Expected benefit
+### Expected benefit
 
 This reduces the number of kernel launches from:
 
@@ -428,7 +428,87 @@ becomes:
 
 This reduces kernel-launch overhead and increases the amount of parallel work per kernel launch.
 
-Result
-Version	PASS/FAIL	Optimized mean time
-Before Optimization 9	PASS	12.69 ms
-After Optimization 9	PASS	6.47 ms
+### Result
+| Version | PASS/FAIL | Optimized mean time |
+|---|---|---:|
+| Before Optimization 9 | PASS | 12.69 ms |
+| After Optimization 9 | PASS | 6.47 ms |
+
+---
+
+## Optimization 10: Asynchronous Input and Output Copies Using CUDA Streams
+Current behavior
+
+After Optimization 9, all simulations are processed together using a 3D CUDA grid.
+
+However, the input and output copies were still done using regular synchronous cudaMemcpy calls.
+
+### Conceptually:
+
+copy all input simulations to GPU
+run all timesteps
+copy all output simulations back to CPU
+### Problem
+
+Synchronous memory copies block the host until the copy is complete.
+
+Since the project uses pinned host memory, we can try using cudaMemcpyAsync with CUDA streams for host-device transfers.
+
+This may reduce copy overhead and allow CUDA to schedule transfers more efficiently.
+
+### Optimization idea
+
+Create one CUDA stream per simulation:
+
+static cudaStream_t *sim_streams = NULL;
+
+In heat_simulate_optimized_init, allocate the stream array and create the streams:
+```c
+sim_streams = (cudaStream_t *)malloc(
+    (size_t)num_simulations * sizeof(cudaStream_t));
+
+for (int s = 0; s < num_simulations; s++) {
+    cudaStreamCreate(&sim_streams[s]);
+}
+```
+Then copy each simulation input asynchronously into its slice of the large device buffer:
+```c
+cudaMemcpyAsync(
+    d_buffer_a + (size_t)s * grid_cells,
+    initial_states[s],
+    optimized_grid_bytes,
+    cudaMemcpyHostToDevice,
+    sim_streams[s]);
+```
+Before starting the timestep kernels, synchronize the input streams to ensure all initial states are available on the GPU:
+```c
+for (int s = 0; s < num_simulations; s++) {
+    cudaStreamSynchronize(sim_streams[s]);
+}
+```
+After all timestep kernels finish, copy each final simulation result back asynchronously:
+```c
+cudaMemcpyAsync(
+    final_states[s],
+    d_current + (size_t)s * grid_cells,
+    optimized_grid_bytes,
+    cudaMemcpyDeviceToHost,
+    sim_streams[s]);
+```
+Finally, synchronize the streams before returning:
+```c
+for (int s = 0; s < num_simulations; s++) {
+    cudaStreamSynchronize(sim_streams[s]);
+}
+```
+### Expected benefit
+
+Using asynchronous copies with streams can reduce input/output transfer overhead.
+
+The expected improvement is small because the main workload is the stencil computation, but the optimization is safe and uses native CUDA features.
+
+### Result
+| Version | PASS/FAIL | Optimized mean time |
+|---|---|---:|
+| Before Optimization 10 | PASS |  6.47 ms |
+| After Optimization 10 | PASS | 6.41 ms |

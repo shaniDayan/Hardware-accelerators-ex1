@@ -1,16 +1,32 @@
 #include "simulation.cuh"
 
 #include <cuda_runtime.h>
+#include <stdlib.h>
+
 #include "physics.cuh"
 
-
-/* Optimization 5: weights are stored in constant memory */
+/*
+ * Optimization 5:
+ * Store stencil weights in constant memory.
+ * The weights are small, read-only, and shared by all threads.
+ */
 __constant__ float d_weights_const[WEIGHTS_COUNT];
 
-/* Optimization 2: main simulation buffers are allocated once */
+/*
+ * Optimization 2 + 9:
+ * Allocate reusable device buffers once.
+ * The buffers are large enough to store all simulations.
+ */
 static float *d_buffer_a = NULL;
 static float *d_buffer_b = NULL;
 static size_t optimized_grid_bytes = 0;
+
+/*
+ * Optimization 10:
+ * Use streams for asynchronous input/output copies.
+ */
+static cudaStream_t *sim_streams = NULL;
+static int optimized_num_simulations = 0;
 
 static void swap_buffers(float **a, float **b)
 {
@@ -19,10 +35,15 @@ static void swap_buffers(float **a, float **b)
     *b = tmp;
 }
 
-/* Optimization 3: shared memory tiled stencil kernel */
 /*
+ * Optimization 3:
+ * Shared memory tiled stencil kernel.
+ *
  * Optimization 7:
  * Use __restrict__ because current and next are different buffers.
+ *
+ * Optimization 9:
+ * Use blockIdx.z to process multiple simulations in the same kernel launch.
  */
 __global__ void optimized_heat_step_kernel(
     const float *__restrict__ current,
@@ -38,8 +59,7 @@ __global__ void optimized_heat_step_kernel(
 
     /*
      * Optimization 9:
-     * Use the z dimension of the CUDA grid to process all simulations
-     * in the same kernel launch.
+     * Each z-slice of the CUDA grid handles one simulation.
      */
     int sim = blockIdx.z;
     size_t grid_cells = (size_t)width * (size_t)height;
@@ -57,6 +77,7 @@ __global__ void optimized_heat_step_kernel(
     /*
      * Optimization 3:
      * Load tile + halo into shared memory.
+     * Out-of-bounds values must match sample_clamped behavior: 0.0f.
      */
     for (int sy = threadIdx.y; sy < shared_height; sy += blockDim.y) {
         for (int sx = threadIdx.x; sx < shared_width; sx += blockDim.x) {
@@ -74,7 +95,7 @@ __global__ void optimized_heat_step_kernel(
 
     /*
      * Optimization 3:
-     * Make sure the whole tile + halo is loaded before using it.
+     * Ensure the full tile + halo is loaded before using shared memory.
      */
     __syncthreads();
 
@@ -90,10 +111,11 @@ __global__ void optimized_heat_step_kernel(
     /*
      * Optimization 7:
      * Unroll the fixed-size stencil loops.
+     * STENCIL_RADIUS is constant, so the compiler can reduce loop overhead.
      */
-    #pragma unroll
+#pragma unroll
     for (int dy = -STENCIL_RADIUS; dy <= STENCIL_RADIUS; dy++) {
-        #pragma unroll
+#pragma unroll
         for (int dx = -STENCIL_RADIUS; dx <= STENCIL_RADIUS; dx++) {
             float value =
                 shared_tile[(local_y + dy) * shared_width + (local_x + dx)];
@@ -115,23 +137,24 @@ void heat_simulate_optimized_init(
     int num_simulations,
     const float *weights)
 {
-
     /*
-    * Optimization 5:
-    * Copy weights once into constant memory.
-    */
+     * Optimization 5:
+     * Copy weights once into constant memory.
+     */
     CUDA_CHECK(cudaMemcpyToSymbol(
         d_weights_const,
         weights,
         WEIGHTS_COUNT * sizeof(float)));
+
     optimized_grid_bytes =
         (size_t)width * (size_t)height * sizeof(float);
 
     /*
-    * Optimization 9:
-    * Allocate enough space for all simulations.
-    */
-    size_t total_bytes = optimized_grid_bytes * (size_t)num_simulations;
+     * Optimization 2 + 9:
+     * Allocate enough device memory for all simulations.
+     */
+    size_t total_bytes =
+        optimized_grid_bytes * (size_t)num_simulations;
 
     CUDA_CHECK(cudaMalloc(
         &d_buffer_a,
@@ -140,14 +163,41 @@ void heat_simulate_optimized_init(
     CUDA_CHECK(cudaMalloc(
         &d_buffer_b,
         total_bytes));
+
+    /*
+     * Optimization 10:
+     * Create one stream per simulation for async H2D/D2H copies.
+     */
+    optimized_num_simulations = num_simulations;
+
+    sim_streams = (cudaStream_t *)malloc(
+        (size_t)num_simulations * sizeof(cudaStream_t));
+
+    for (int s = 0; s < num_simulations; s++) {
+        CUDA_CHECK(cudaStreamCreate(&sim_streams[s]));
+    }
 }
 
 void heat_simulate_optimized_finalize(void)
 {
+    /*
+     * Optimization 10:
+     * Destroy copy streams.
+     */
+    if (sim_streams != NULL) {
+        for (int s = 0; s < optimized_num_simulations; s++) {
+            CUDA_CHECK(cudaStreamDestroy(sim_streams[s]));
+        }
+
+        free(sim_streams);
+        sim_streams = NULL;
+    }
+
+    optimized_num_simulations = 0;
 
     /*
-     * Optimization 2:
-     * Free reusable buffers once.
+     * Optimization 2 + 9:
+     * Free reusable multi-simulation buffers once.
      */
     if (d_buffer_a != NULL) {
         CUDA_CHECK(cudaFree(d_buffer_a));
@@ -175,16 +225,16 @@ void heat_simulate_optimized(
     (void)weights;
 
     /*
-    * Optimization 4:
-    * Selected block size after benchmarking multiple options.
-    * 32x8 was fastest on lambda for this workload.
-    */
-    dim3 block(32,8);
+     * Optimization 4:
+     * Selected block size after benchmarking multiple options.
+     * 32x8 was fastest on lambda for this workload.
+     */
+    dim3 block(32, 8);
 
     /*
-    * Optimization 9:
-    * Add simulation dimension to the CUDA grid.
-    */
+     * Optimization 9:
+     * Add simulation dimension to the CUDA grid.
+     */
     dim3 grid(
         (width + block.x - 1) / block.x,
         (height + block.y - 1) / block.y,
@@ -202,21 +252,29 @@ void heat_simulate_optimized(
     size_t grid_cells = (size_t)width * (size_t)height;
 
     /*
-    * Optimization 9:
-    * Copy all simulation inputs into one large device buffer.
-    */
+     * Optimization 10:
+     * Copy all simulation inputs asynchronously using streams.
+     */
     for (int s = 0; s < num_simulations; s++) {
-        CUDA_CHECK(cudaMemcpy(
+        CUDA_CHECK(cudaMemcpyAsync(
             d_buffer_a + (size_t)s * grid_cells,
             initial_states[s],
             optimized_grid_bytes,
-            cudaMemcpyHostToDevice));
+            cudaMemcpyHostToDevice,
+            sim_streams[s]));
     }
 
     /*
-    * Optimization 9:
-    * Run all simulations together.
-    */
+     * Inputs must be fully copied before the timestep kernels start.
+     */
+    for (int s = 0; s < num_simulations; s++) {
+        CUDA_CHECK(cudaStreamSynchronize(sim_streams[s]));
+    }
+
+    /*
+     * Optimization 9:
+     * Run all simulations together for each timestep.
+     */
     float *d_current = d_buffer_a;
     float *d_next = d_buffer_b;
 
@@ -234,16 +292,27 @@ void heat_simulate_optimized(
     }
 
     /*
-    * Optimization 9:
-    * Copy all simulation outputs back.
-    */
+     * Make sure all timestep kernels are finished before copying results.
+     */
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /*
+     * Optimization 10:
+     * Copy all simulation outputs asynchronously using streams.
+     */
     for (int s = 0; s < num_simulations; s++) {
-        CUDA_CHECK(cudaMemcpy(
+        CUDA_CHECK(cudaMemcpyAsync(
             final_states[s],
             d_current + (size_t)s * grid_cells,
             optimized_grid_bytes,
-            cudaMemcpyDeviceToHost));
+            cudaMemcpyDeviceToHost,
+            sim_streams[s]));
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    /*
+     * Output copies must be complete before returning to the benchmark.
+     */
+    for (int s = 0; s < num_simulations; s++) {
+        CUDA_CHECK(cudaStreamSynchronize(sim_streams[s]));
+    }
 }
