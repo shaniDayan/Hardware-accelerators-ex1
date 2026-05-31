@@ -3,8 +3,9 @@
 #include <cuda_runtime.h>
 #include "physics.cuh"
 
-/* Optimization 1: weights are allocated and copied once */
-static float *d_weights_optimized = NULL;
+
+/* Optimization 5: weights are stored in constant memory */
+__constant__ float d_weights_const[WEIGHTS_COUNT];
 
 /* Optimization 2: main simulation buffers are allocated once */
 static float *d_buffer_a = NULL;
@@ -19,10 +20,13 @@ static void swap_buffers(float **a, float **b)
 }
 
 /* Optimization 3: shared memory tiled stencil kernel */
+/*
+ * Optimization 7:
+ * Use __restrict__ because current and next are different buffers.
+ */
 __global__ void optimized_heat_step_kernel(
-    const float *current,
-    const float *weights,
-    float *next,
+    const float *__restrict__ current,
+    float *__restrict__ next,
     int width,
     int height,
     int timestep)
@@ -31,6 +35,18 @@ __global__ void optimized_heat_step_kernel(
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    /*
+     * Optimization 9:
+     * Use the z dimension of the CUDA grid to process all simulations
+     * in the same kernel launch.
+     */
+    int sim = blockIdx.z;
+    size_t grid_cells = (size_t)width * (size_t)height;
+    size_t sim_offset = (size_t)sim * grid_cells;
+
+    const float *sim_current = current + sim_offset;
+    float *sim_next = next + sim_offset;
 
     int shared_width = blockDim.x + 2 * STENCIL_RADIUS;
     int shared_height = blockDim.y + 2 * STENCIL_RADIUS;
@@ -51,7 +67,7 @@ __global__ void optimized_heat_step_kernel(
                 shared_tile[sy * shared_width + sx] = 0.0f;
             } else {
                 shared_tile[sy * shared_width + sx] =
-                    current[gy * width + gx];
+                    sim_current[gy * width + gx];
             }
         }
     }
@@ -72,23 +88,25 @@ __global__ void optimized_heat_step_kernel(
     float source = heat_source(timestep, x, y, width, height);
 
     /*
-     * Optimization 3:
-     * Read stencil values from shared memory instead of global memory.
+     * Optimization 7:
+     * Unroll the fixed-size stencil loops.
      */
+    #pragma unroll
     for (int dy = -STENCIL_RADIUS; dy <= STENCIL_RADIUS; dy++) {
+        #pragma unroll
         for (int dx = -STENCIL_RADIUS; dx <= STENCIL_RADIUS; dx++) {
             float value =
                 shared_tile[(local_y + dy) * shared_width + (local_x + dx)];
 
             float weight =
-                weights[(dy + STENCIL_RADIUS) * STENCIL_SIZE +
-                        (dx + STENCIL_RADIUS)];
+                d_weights_const[(dy + STENCIL_RADIUS) * STENCIL_SIZE +
+                                (dx + STENCIL_RADIUS)];
 
             source += value * weight;
         }
     }
 
-    next[y * width + x] = source;
+    sim_next[y * width + x] = source;
 }
 
 void heat_simulate_optimized_init(
@@ -97,48 +115,35 @@ void heat_simulate_optimized_init(
     int num_simulations,
     const float *weights)
 {
-    (void)num_simulations;
 
     /*
-     * Optimization 1:
-     * Allocate and copy weights once.
-     */
-    CUDA_CHECK(cudaMalloc(
-        &d_weights_optimized,
-        WEIGHTS_COUNT * sizeof(float)));
-
-    CUDA_CHECK(cudaMemcpy(
-        d_weights_optimized,
+    * Optimization 5:
+    * Copy weights once into constant memory.
+    */
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        d_weights_const,
         weights,
-        WEIGHTS_COUNT * sizeof(float),
-        cudaMemcpyHostToDevice));
-
+        WEIGHTS_COUNT * sizeof(float)));
     optimized_grid_bytes =
         (size_t)width * (size_t)height * sizeof(float);
 
     /*
-     * Optimization 2:
-     * Allocate current/next buffers once.
-     */
+    * Optimization 9:
+    * Allocate enough space for all simulations.
+    */
+    size_t total_bytes = optimized_grid_bytes * (size_t)num_simulations;
+
     CUDA_CHECK(cudaMalloc(
         &d_buffer_a,
-        optimized_grid_bytes));
+        total_bytes));
 
     CUDA_CHECK(cudaMalloc(
         &d_buffer_b,
-        optimized_grid_bytes));
+        total_bytes));
 }
 
 void heat_simulate_optimized_finalize(void)
 {
-    /*
-     * Optimization 1:
-     * Free weights once.
-     */
-    if (d_weights_optimized != NULL) {
-        CUDA_CHECK(cudaFree(d_weights_optimized));
-        d_weights_optimized = NULL;
-    }
 
     /*
      * Optimization 2:
@@ -170,15 +175,20 @@ void heat_simulate_optimized(
     (void)weights;
 
     /*
-    * Optimization 3:
-    * Block size chosen for shared memory tiling.
+    * Optimization 4:
+    * Selected block size after benchmarking multiple options.
+    * 32x8 was fastest on lambda for this workload.
     */
-    dim3 block(16, 16);
-    dim3 block(16, 16);
+    dim3 block(32,8);
 
+    /*
+    * Optimization 9:
+    * Add simulation dimension to the CUDA grid.
+    */
     dim3 grid(
         (width + block.x - 1) / block.x,
-        (height + block.y - 1) / block.y);
+        (height + block.y - 1) / block.y,
+        num_simulations);
 
     /*
      * Optimization 3:
@@ -189,40 +199,51 @@ void heat_simulate_optimized(
     size_t shared_bytes =
         shared_width * shared_height * sizeof(float);
 
-    for (int s = 0; s < num_simulations; s++) {
-        /*
-         * Optimization 2:
-         * Reuse the already allocated buffers.
-         */
-        float *d_current = d_buffer_a;
-        float *d_next = d_buffer_b;
+    size_t grid_cells = (size_t)width * (size_t)height;
 
+    /*
+    * Optimization 9:
+    * Copy all simulation inputs into one large device buffer.
+    */
+    for (int s = 0; s < num_simulations; s++) {
         CUDA_CHECK(cudaMemcpy(
-            d_current,
+            d_buffer_a + (size_t)s * grid_cells,
             initial_states[s],
             optimized_grid_bytes,
             cudaMemcpyHostToDevice));
+    }
 
-        for (int step = start_step; step < start_step + num_steps; step++) {
-            optimized_heat_step_kernel<<<grid, block, shared_bytes>>>(
-                d_current,
-                d_weights_optimized,
-                d_next,
-                width,
-                height,
-                step);
+    /*
+    * Optimization 9:
+    * Run all simulations together.
+    */
+    float *d_current = d_buffer_a;
+    float *d_next = d_buffer_b;
 
-            CUDA_CHECK(cudaGetLastError());
+    for (int step = start_step; step < start_step + num_steps; step++) {
+        optimized_heat_step_kernel<<<grid, block, shared_bytes>>>(
+            d_current,
+            d_next,
+            width,
+            height,
+            step);
 
-            swap_buffers(&d_current, &d_next);
-        }
+        CUDA_CHECK(cudaGetLastError());
 
+        swap_buffers(&d_current, &d_next);
+    }
+
+    /*
+    * Optimization 9:
+    * Copy all simulation outputs back.
+    */
+    for (int s = 0; s < num_simulations; s++) {
         CUDA_CHECK(cudaMemcpy(
             final_states[s],
-            d_current,
+            d_current + (size_t)s * grid_cells,
             optimized_grid_bytes,
             cudaMemcpyDeviceToHost));
-
-        CUDA_CHECK(cudaDeviceSynchronize());
     }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
 }

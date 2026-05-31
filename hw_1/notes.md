@@ -83,7 +83,7 @@ So we reuse the GPU memory allocation, but not the old simulation data.
 
 ---
 
-## Optimization Idea: Shared Memory Tiling
+## Optimization 3: Shared Memory Tiling
 
 Each thread computes one output cell, but neighboring threads read many of the same input cells from global memory.
 
@@ -107,7 +107,7 @@ the shared memory tile size is:
 Then:
 
 Threads cooperatively load the tile and halo from global memory into shared memory.
-__syncthreads() ensures all values are loaded.
+`__syncthreads()` ensures all values are loaded.
 Each thread computes its output cell using shared memory.
 Each thread writes one result to global memory.
 
@@ -157,21 +157,23 @@ For example:
 `dim3 block(8, 32);`
 `dim3 block(32, 16);`
 
-For the first shared-memory version, we will start with:
+### Block-size benchmark
 
-`dim3 block(16, 16);`
+After adding shared memory tiling, we benchmarked several block sizes on lambda.
 
-because it gives:
+| Block size | PASS/FAIL | Optimized mean time |
+|---|---|---:|
+| 8x8 | PASS | 17.00 ms |
+| 16x16 | PASS | 15.79 ms |
+| 32x8 | PASS | 12.82 ms |
+| 8x32 | PASS | 16.21 ms |
+| 64x4 | PASS | 14.48 ms |
+| 64x8 | PASS | 17.42 ms |
+| 32x16 | PASS | 16.04 ms |
 
-16 * 16 = 256 threads per block
+The best tested configuration was `32x8`.
 
-and the shared-memory tile is:
-
-(16 + 2*6) x (16 + 2*6)
-= 28 x 28
-= 784 floats
-
-This is a safer starting point than 32 x 32.
+This likely works well because the grid is stored in row-major order, so a block that is wider in the x direction gives better memory access behavior while keeping shared memory usage moderate.
 
 ### Expected benefit
 
@@ -208,13 +210,225 @@ Store the weights in CUDA constant memory:
 __constant__ float d_weights_const[WEIGHTS_COUNT];
 ```
 Copy the weights once in heat_simulate_optimized_init using:
-
+```c
 cudaMemcpyToSymbol(d_weights_const, weights, WEIGHTS_COUNT * sizeof(float));
-
+```
 Then the kernel reads directly from d_weights_const.
 
-Expected benefit
+### Expected benefit
 
 Constant memory is cached and is especially efficient when many threads in a warp read the same address.
 
 In this stencil computation, all threads iterate over the same weight indices, so constant memory is a good fit.
+
+---
+
+## Optimization 6: Fast Path for Interior Blocks
+
+### Current behavior
+
+In the shared-memory tiled kernel, every block loads a tile plus halo into shared memory.
+
+For every value loaded, the code checks whether the global coordinates are outside the grid:
+
+```c
+if (gx < 0 || gx >= width || gy < 0 || gy >= height) {
+    shared_tile[...] = 0.0f;
+} else {
+    shared_tile[...] = current[gy * width + gx];
+}
+```
+This is required for boundary blocks, because the reference behavior returns `0.0f` for out-of-bounds accesses.
+
+### Problem
+
+Most blocks are interior blocks.
+
+For interior blocks, the entire tile plus halo is inside the grid, so the boundary check is unnecessary.
+
+Performing this check for every shared-memory load adds extra overhead.
+
+### Optimization idea
+
+Add a fast path for interior blocks.
+
+If the block’s tile plus halo is fully inside the grid, load directly from global memory without boundary checks.
+
+Otherwise, use the safe boundary-handling version.
+
+Conceptually:
+```text
+if block is interior:
+    load tile + halo directly
+else:
+    load tile + halo with boundary checks
+```
+### Expected benefit
+
+This reduces branch overhead during shared-memory loading for interior blocks.
+
+It should help especially because the stencil radius is large (STENCIL_RADIUS = 6), so each block loads many halo values.
+
+### Result
+
+| Grid size | Without Opt 6 | With Opt 6 | Better? |
+|---|---:|---:|---|
+| 128x128 | 12.82 ms | 12.84 ms | Without Opt 6 |
+| 256x256 | 26.94 ms | 26.80 ms | With Opt 6 |
+
+### Conclusion
+
+This optimization slightly improved performance for a larger `256x256` grid, but did not improve the provided `128x128` benchmark.
+
+For now, we decided not to keep it in the final code. If the grading benchmark includes larger grids, we may restore this optimization later.
+
+---
+
+## Optimization 7: Loop Unrolling and Pointer Restriction
+
+### Idea
+
+The stencil radius is fixed at compile time:
+
+```c
+STENCIL_RADIUS = 6
+```
+Therefore, the stencil loop always performs:
+
+13 x 13 = 169 iterations
+
+We added `#pragma unroll` to the stencil loops to encourage the compiler to unroll them and reduce loop overhead.
+
+We also marked kernel pointers with `__restrict__`:
+```c
+const float *__restrict__ current
+float *__restrict__ next
+```
+This tells the compiler that current and next do not alias, which is true because they point to different device buffers.
+
+### Result
+| Version | PASS/FAIL | Optimized mean time |
+|---|---|---:|
+| Before Optimization 7 | PASS | 12.82 ms |
+| After Optimization 7 | PASS | 12.69 ms |
+
+### Conclusion
+
+This gave a small improvement and preserved correctness, so we kept it.
+
+---
+## Optimization 9: Process All Simulations Together Using a 3D CUDA Grid
+### Current behavior
+
+Before this optimization, the optimized implementation still processed the simulations one after another:
+```c
+for (int s = 0; s < num_simulations; s++) {
+    copy initial_states[s];
+
+    for (int step = start_step; step < start_step + num_steps; step++) {
+        launch kernel for simulation s;
+        swap buffers;
+    }
+
+    copy final_states[s];
+}
+```
+
+This means that for:
+
+`num_simulations = 10`
+`num_steps = 300`
+
+the code launched:
+
+10 * 300 = 3000 kernel launches
+## Problem
+
+Each simulation is independent from the others.
+
+Therefore, running them sequentially creates unnecessary kernel-launch overhead and does not fully use the GPU parallelism across simulations.
+
+## Optimization idea
+
+Use the z dimension of the CUDA grid to process all simulations in the same kernel launch.
+
+Instead of launching one kernel per simulation per timestep, we launch one kernel per timestep, where:
+
+`blockIdx.z`
+
+represents the simulation index.
+
+Conceptually:
+```text
+Before:
+for each simulation:
+    for each timestep:
+        launch kernel
+
+After:
+for each timestep:
+    launch one kernel for all simulations
+```
+The CUDA grid becomes 3D:
+```text
+dim3 grid(
+    (width + block.x - 1) / block.x,
+    (height + block.y - 1) / block.y,
+    num_simulations);
+```
+Inside the kernel:
+
+int sim = blockIdx.z;
+
+size_t grid_cells = (size_t)width * (size_t)height;
+size_t sim_offset = (size_t)sim * grid_cells;
+
+const float *sim_current = current + sim_offset;
+float *sim_next = next + sim_offset;
+
+Each simulation gets its own slice inside the large device buffers.
+
+Buffer layout
+
+Instead of allocating space for one simulation:
+
+width * height
+
+we allocate space for all simulations:
+
+num_simulations * width * height
+
+So the device buffers are arranged like this:
+
+d_buffer_a:
+[ simulation 0 grid ][ simulation 1 grid ][ simulation 2 grid ] ... [ simulation 9 grid ]
+
+d_buffer_b:
+[ simulation 0 grid ][ simulation 1 grid ][ simulation 2 grid ] ... [ simulation 9 grid ]
+
+Each simulation is independent, but all of them are processed in the same kernel launch.
+
+Expected benefit
+
+This reduces the number of kernel launches from:
+
+num_simulations * num_steps
+
+to:
+
+num_steps
+
+For the benchmark:
+
+10 * 300 = 3000 launches
+
+becomes:
+
+300 launches
+
+This reduces kernel-launch overhead and increases the amount of parallel work per kernel launch.
+
+Result
+Version	PASS/FAIL	Optimized mean time
+Before Optimization 9	PASS	12.69 ms
+After Optimization 9	PASS	6.47 ms
