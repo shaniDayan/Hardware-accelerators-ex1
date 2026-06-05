@@ -28,11 +28,47 @@ static size_t optimized_grid_bytes = 0;
 static cudaStream_t *sim_streams = NULL;
 static int optimized_num_simulations = 0;
 
+/*
+ * Optimization 11:
+ * Use CUDA Graphs for the repeated timestep kernel launches.
+ * The graph is cached and reused when the simulation parameters match.
+ */
+static cudaStream_t graph_stream;
+static cudaGraph_t timestep_graph = NULL;
+static cudaGraphExec_t timestep_graph_exec = NULL;
+
+static int graph_width = 0;
+static int graph_height = 0;
+static int graph_num_simulations = 0;
+static int graph_start_step = 0;
+static int graph_num_steps = 0;
+static size_t graph_shared_bytes = 0;
+
 static void swap_buffers(float **a, float **b)
 {
     float *tmp = *a;
     *a = *b;
     *b = tmp;
+}
+
+static void destroy_timestep_graph(void)
+{
+    if (timestep_graph_exec != NULL) {
+        CUDA_CHECK(cudaGraphExecDestroy(timestep_graph_exec));
+        timestep_graph_exec = NULL;
+    }
+
+    if (timestep_graph != NULL) {
+        CUDA_CHECK(cudaGraphDestroy(timestep_graph));
+        timestep_graph = NULL;
+    }
+
+    graph_width = 0;
+    graph_height = 0;
+    graph_num_simulations = 0;
+    graph_start_step = 0;
+    graph_num_steps = 0;
+    graph_shared_bytes = 0;
 }
 
 /*
@@ -176,10 +212,23 @@ void heat_simulate_optimized_init(
     for (int s = 0; s < num_simulations; s++) {
         CUDA_CHECK(cudaStreamCreate(&sim_streams[s]));
     }
+
+    /*
+     * Optimization 11:
+     * Create a dedicated stream for CUDA Graph capture and launch.
+     */
+    CUDA_CHECK(cudaStreamCreate(&graph_stream));
 }
 
 void heat_simulate_optimized_finalize(void)
 {
+    /*
+     * Optimization 11:
+     * Destroy the cached CUDA Graph and graph stream.
+     */
+    destroy_timestep_graph();
+    CUDA_CHECK(cudaStreamDestroy(graph_stream));
+
     /*
      * Optimization 10:
      * Destroy copy streams.
@@ -272,29 +321,83 @@ void heat_simulate_optimized(
     }
 
     /*
-     * Optimization 9:
-     * Run all simulations together for each timestep.
+     * Optimization 11:
+     * Build the CUDA Graph only when needed.
+     * If parameters change, rebuild the graph to avoid reusing a stale graph.
      */
-    float *d_current = d_buffer_a;
-    float *d_next = d_buffer_b;
+    bool need_rebuild =
+        (timestep_graph_exec == NULL) ||
+        (graph_width != width) ||
+        (graph_height != height) ||
+        (graph_num_simulations != num_simulations) ||
+        (graph_start_step != start_step) ||
+        (graph_num_steps != num_steps) ||
+        (graph_shared_bytes != shared_bytes);
 
-    for (int step = start_step; step < start_step + num_steps; step++) {
-        optimized_heat_step_kernel<<<grid, block, shared_bytes>>>(
-            d_current,
-            d_next,
-            width,
-            height,
-            step);
+    if (need_rebuild) {
+        destroy_timestep_graph();
 
-        CUDA_CHECK(cudaGetLastError());
+        /*
+         * Optimization 11:
+         * Capture the repeated timestep kernel launches into a CUDA Graph.
+         */
+        CUDA_CHECK(cudaStreamBeginCapture(
+            graph_stream,
+            cudaStreamCaptureModeGlobal));
 
-        swap_buffers(&d_current, &d_next);
+        float *d_current = d_buffer_a;
+        float *d_next = d_buffer_b;
+
+        for (int step = start_step; step < start_step + num_steps; step++) {
+            optimized_heat_step_kernel<<<grid, block, shared_bytes, graph_stream>>>(
+                d_current,
+                d_next,
+                width,
+                height,
+                step);
+
+            swap_buffers(&d_current, &d_next);
+        }
+
+        CUDA_CHECK(cudaStreamEndCapture(
+            graph_stream,
+            &timestep_graph));
+
+        CUDA_CHECK(cudaGraphInstantiate(
+            &timestep_graph_exec,
+            timestep_graph,
+            NULL,
+            NULL,
+            0));
+
+        graph_width = width;
+        graph_height = height;
+        graph_num_simulations = num_simulations;
+        graph_start_step = start_step;
+        graph_num_steps = num_steps;
+        graph_shared_bytes = shared_bytes;
     }
 
     /*
-     * Make sure all timestep kernels are finished before copying results.
+     * Optimization 11:
+     * Replay all captured timestep kernels with lower CPU-side launch overhead.
      */
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGraphLaunch(
+        timestep_graph_exec,
+        graph_stream));
+
+    /*
+     * Wait until the graph execution is complete before copying results.
+     */
+    CUDA_CHECK(cudaStreamSynchronize(graph_stream));
+
+    /*
+     * The graph starts from d_buffer_a.
+     * If num_steps is even, the final result is back in d_buffer_a.
+     * If num_steps is odd, the final result is in d_buffer_b.
+     */
+    float *final_d_current =
+        (num_steps % 2 == 0) ? d_buffer_a : d_buffer_b;
 
     /*
      * Optimization 10:
@@ -303,7 +406,7 @@ void heat_simulate_optimized(
     for (int s = 0; s < num_simulations; s++) {
         CUDA_CHECK(cudaMemcpyAsync(
             final_states[s],
-            d_current + (size_t)s * grid_cells,
+            final_d_current + (size_t)s * grid_cells,
             optimized_grid_bytes,
             cudaMemcpyDeviceToHost,
             sim_streams[s]));
